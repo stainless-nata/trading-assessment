@@ -1,0 +1,284 @@
+name: Deploy to AWS ECS
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: trading-api
+  ECS_CLUSTER: trading-cluster
+  ECS_SERVICE: trading-service
+  ECS_TASK_DEFINITION: task-definition.json
+  CONTAINER_NAME: trading-api
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.21'
+
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    - name: Install dependencies
+      run: go mod download
+
+    - name: Run tests
+      run: go test -v ./...
+
+    - name: Build application
+      run: go build -v ./...
+
+  build-and-deploy:
+    name: Build and Deploy
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build, tag, and push image to Amazon ECR
+      id: build-image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        # Build a docker container and push it to ECR
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+    - name: Create task definition
+      id: task-def
+      run: |
+        cat > task-definition.json << EOF
+        {
+          "family": "${{ env.ECS_SERVICE }}",
+          "networkMode": "awsvpc",
+          "requiresCompatibilities": ["FARGATE"],
+          "cpu": "512",
+          "memory": "1024",
+          "executionRoleArn": "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole",
+          "taskRoleArn": "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/ecsTaskRole",
+          "containerDefinitions": [
+            {
+              "name": "${{ env.CONTAINER_NAME }}",
+              "image": "${{ steps.build-image.outputs.image }}",
+              "portMappings": [
+                {
+                  "containerPort": 8080,
+                  "protocol": "tcp"
+                }
+              ],
+              "essential": true,
+              "environment": [
+                {
+                  "name": "SERVER_PORT",
+                  "value": "8080"
+                },
+                {
+                  "name": "SOLANA_RPC_URL",
+                  "value": "https://pomaded-lithotomies-xfbhnqagbt-dedicated.helius-rpc.com/?api-key=37ba4475-8fa3-4491-875f-758894981943"
+                }
+              ],
+              "secrets": [
+                {
+                  "name": "DISCORD_WEBHOOK",
+                  "valueFrom": "arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:secret:discord-webhook-url"
+                }
+              ],
+              "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                  "awslogs-group": "/ecs/trading-api",
+                  "awslogs-region": "${{ env.AWS_REGION }}",
+                  "awslogs-stream-prefix": "ecs"
+                }
+              },
+              "healthCheck": {
+                "command": [
+                  "CMD-SHELL",
+                  "curl -f http://localhost:8080/health || exit 1"
+                ],
+                "interval": 30,
+                "timeout": 5,
+                "retries": 3,
+                "startPeriod": 60
+              }
+            }
+          ]
+        }
+        EOF
+
+    - name: Deploy Canary (10% traffic)
+      id: deploy-canary
+      run: |
+        # Create canary service if it doesn't exist
+        if ! aws ecs describe-services --cluster ${{ env.ECS_CLUSTER }} --services ${{ env.ECS_SERVICE }}-canary --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
+          echo "Creating canary service..."
+          aws ecs create-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service-name ${{ env.ECS_SERVICE }}-canary \
+            --task-definition task-definition.json \
+            --desired-count 1 \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ secrets.SUBNET_IDS }}],securityGroups=[${{ secrets.SECURITY_GROUP_ID }}],assignPublicIp=ENABLED}" \
+            --load-balancers targetGroupArn=${{ secrets.CANARY_TARGET_GROUP_ARN }},containerName=${{ env.CONTAINER_NAME }},containerPort=8080 \
+            --region ${{ env.AWS_REGION }}
+        else
+          echo "Updating canary service..."
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }}-canary \
+            --task-definition task-definition.json \
+            --region ${{ env.AWS_REGION }}
+        fi
+
+        # Wait for canary to be stable
+        aws ecs wait services-stable --cluster ${{ env.ECS_CLUSTER }} --services ${{ env.ECS_SERVICE }}-canary --region ${{ env.AWS_REGION }}
+
+    - name: Health Check Canary
+      id: health-check
+      run: |
+        echo "Performing health checks on canary deployment..."
+        CANARY_ENDPOINT="${{ secrets.CANARY_ENDPOINT }}"
+        
+        # Perform multiple health checks over 5 minutes
+        for i in {1..10}; do
+          echo "Health check attempt $i/10"
+          if curl -f -s "$CANARY_ENDPOINT/health" > /dev/null; then
+            echo "Health check $i passed"
+          else
+            echo "Health check $i failed"
+            echo "CANARY_HEALTH_FAILED=true" >> $GITHUB_ENV
+            exit 1
+          fi
+          sleep 30
+        done
+        
+        echo "All canary health checks passed"
+
+    - name: Load Test Canary
+      if: success()
+      run: |
+        echo "Running load test on canary..."
+        CANARY_ENDPOINT="${{ secrets.CANARY_ENDPOINT }}"
+        
+        # Simple load test - 100 requests over 2 minutes
+        for i in {1..100}; do
+          response=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$CANARY_ENDPOINT/api/get-balance" \
+            -H "Content-Type: application/json" \
+            -H "X-API-Key: test-api-key-1" \
+            -d '{"wallets": ["11111111111111111111111111111112"]}')
+          
+          if [ "$response" != "200" ]; then
+            echo "Load test failed with HTTP $response"
+            echo "CANARY_LOAD_TEST_FAILED=true" >> $GITHUB_ENV
+            exit 1
+          fi
+          
+          if [ $((i % 10)) -eq 0 ]; then
+            echo "Completed $i/100 requests"
+          fi
+          
+          sleep 1
+        done
+        
+        echo "Load test passed"
+
+    - name: Deploy to Production (Full Rollout)
+      if: success() && env.CANARY_HEALTH_FAILED != 'true' && env.CANARY_LOAD_TEST_FAILED != 'true'
+      run: |
+        echo "Deploying to production..."
+        
+        # Update main production service
+        aws ecs update-service \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --service ${{ env.ECS_SERVICE }} \
+          --task-definition task-definition.json \
+          --region ${{ env.AWS_REGION }}
+        
+        # Wait for production deployment to be stable
+        aws ecs wait services-stable --cluster ${{ env.ECS_CLUSTER }} --services ${{ env.ECS_SERVICE }} --region ${{ env.AWS_REGION }}
+        
+        echo "Production deployment completed successfully"
+
+    - name: Rollback on Failure
+      if: failure() || env.CANARY_HEALTH_FAILED == 'true' || env.CANARY_LOAD_TEST_FAILED == 'true'
+      run: |
+        echo "Deployment failed, initiating rollback..."
+        
+        # Get current running task definition
+        CURRENT_TASK_DEF=$(aws ecs describe-services --cluster ${{ env.ECS_CLUSTER }} --services ${{ env.ECS_SERVICE }} --query 'services[0].taskDefinition' --output text --region ${{ env.AWS_REGION }})
+        
+        echo "Current production task definition: $CURRENT_TASK_DEF"
+        
+        # Rollback canary to previous version if it exists
+        if aws ecs describe-services --cluster ${{ env.ECS_CLUSTER }} --services ${{ env.ECS_SERVICE }}-canary --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }}-canary \
+            --desired-count 0 \
+            --region ${{ env.AWS_REGION }}
+        fi
+        
+        # Send notification
+        curl -X POST "${{ secrets.DISCORD_WEBHOOK_URL }}" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "content": "🚨 **DEPLOYMENT FAILED** 🚨\n```\nRepository: ${{ github.repository }}\nCommit: ${{ github.sha }}\nBranch: ${{ github.ref_name }}\nReason: Canary deployment failed health checks or load tests\nAction: Automatic rollback initiated\n```"
+          }' || true
+
+    - name: Cleanup Canary
+      if: always()
+      run: |
+        echo "Cleaning up canary deployment..."
+        
+        # Scale down canary service to 0
+        if aws ecs describe-services --cluster ${{ env.ECS_CLUSTER }} --services ${{ env.ECS_SERVICE }}-canary --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }}-canary \
+            --desired-count 0 \
+            --region ${{ env.AWS_REGION }}
+        fi
+
+    - name: Deployment Success Notification
+      if: success() && env.CANARY_HEALTH_FAILED != 'true' && env.CANARY_LOAD_TEST_FAILED != 'true'
+      run: |
+        curl -X POST "${{ secrets.DISCORD_WEBHOOK_URL }}" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "content": "**DEPLOYMENT SUCCESSFUL**\n```\nRepository: ${{ github.repository }}\nCommit: ${{ github.sha }}\nBranch: ${{ github.ref_name }}\nImage: ${{ steps.build-image.outputs.image }}\nStatus: Production deployment completed\n```"
+          }' || true
