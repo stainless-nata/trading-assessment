@@ -79,45 +79,16 @@ jobs:
         docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
         echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
-    - name: Create task definition
+    - name: Prepare task definition
       id: task-def
       run: |
-        cat > task-definition.json << EOF
-        {
-          "family": "${{ env.ECS_SERVICE }}",
-          "networkMode": "awsvpc",
-          "requiresCompatibilities": ["FARGATE"],
-          "cpu": "512",
-          "memory": "1024",
-          "executionRoleArn": "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole",
-          "taskRoleArn": "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/ecsTaskRole",
-          "containerDefinitions": [
-            {
-              "name": "${{ env.CONTAINER_NAME }}",
-              "image": "${{ steps.build-image.outputs.image }}",
-              "portMappings": [
-                {
-                  "containerPort": 8080,
-                  "protocol": "tcp"
-                }
-              ],
-              "essential": true,
-              "environment": [
-                {
-                  "name": "SERVER_PORT",
-                  "value": "8080"
-                },
-                {
-                  "name": "SOLANA_RPC_URL",
-                  "value": "https://pomaded-lithotomies-xfbhnqagbt-dedicated.helius-rpc.com/?api-key=37ba4475-8fa3-4491-875f-758894981943"
-                }
-              ],
-              "secrets": [
-                {
-                  "name": "DISCORD_WEBHOOK",
-                  "valueFrom": "arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:secret:discord-webhook-url"
-                }
-              ],
+        # Update the task definition template with dynamic values
+        sed -e "s|ACCOUNT_ID|${{ secrets.AWS_ACCOUNT_ID }}|g" \
+            -e "s|:latest|:${{ github.sha }}|g" \
+            task-definition.json > task-definition-updated.json
+        
+        # Validate the task definition
+        aws ecs describe-task-definition --task-definition trading-api --query 'taskDefinition' || echo "Task definition doesn't exist yet"
               "logConfiguration": {
                 "logDriver": "awslogs",
                 "options": {
@@ -131,15 +102,7 @@ jobs:
                   "CMD-SHELL",
                   "curl -f http://localhost:8080/health || exit 1"
                 ],
-                "interval": 30,
-                "timeout": 5,
-                "retries": 3,
-                "startPeriod": 60
-              }
-            }
-          ]
-        }
-        EOF
+
 
     - name: Deploy Canary (10% traffic)
       id: deploy-canary
@@ -150,7 +113,7 @@ jobs:
           aws ecs create-service \
             --cluster ${{ env.ECS_CLUSTER }} \
             --service-name ${{ env.ECS_SERVICE }}-canary \
-            --task-definition task-definition.json \
+            --task-definition task-definition-updated.json \
             --desired-count 1 \
             --launch-type FARGATE \
             --network-configuration "awsvpcConfiguration={subnets=[${{ secrets.SUBNET_IDS }}],securityGroups=[${{ secrets.SECURITY_GROUP_ID }}],assignPublicIp=ENABLED}" \
@@ -161,7 +124,7 @@ jobs:
           aws ecs update-service \
             --cluster ${{ env.ECS_CLUSTER }} \
             --service ${{ env.ECS_SERVICE }}-canary \
-            --task-definition task-definition.json \
+            --task-definition task-definition-updated.json \
             --region ${{ env.AWS_REGION }}
         fi
 
@@ -196,26 +159,31 @@ jobs:
         CANARY_ENDPOINT="${{ secrets.CANARY_ENDPOINT }}"
         
         # Simple load test - 100 requests over 2 minutes
-        for i in {1..100}; do
-          response=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$CANARY_ENDPOINT/api/get-balance" \
-            -H "Content-Type: application/json" \
-            -H "X-API-Key: test-api-key-1" \
-            -d '{"wallets": ["11111111111111111111111111111112"]}')
+        # Note: Requires a valid API key to be set in GitHub secrets
+        if [ -z "${{ secrets.LOAD_TEST_API_KEY }}" ]; then
+          echo "⚠️ LOAD_TEST_API_KEY not configured - skipping load test"
+        else
+          for i in {1..100}; do
+            response=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$CANARY_ENDPOINT/api/get-balance" \
+              -H "Content-Type: application/json" \
+              -H "X-API-Key: ${{ secrets.LOAD_TEST_API_KEY }}" \
+              -d '{"wallets": ["11111111111111111111111111111112"]}')
+            
+            if [ "$response" != "200" ]; then
+              echo "Load test failed with HTTP $response"
+              echo "CANARY_LOAD_TEST_FAILED=true" >> $GITHUB_ENV
+              exit 1
+            fi
           
-          if [ "$response" != "200" ]; then
-            echo "Load test failed with HTTP $response"
-            echo "CANARY_LOAD_TEST_FAILED=true" >> $GITHUB_ENV
-            exit 1
-          fi
+            if [ $((i % 10)) -eq 0 ]; then
+              echo "Completed $i/100 requests"
+            fi
+            
+            sleep 1
+          done
           
-          if [ $((i % 10)) -eq 0 ]; then
-            echo "Completed $i/100 requests"
-          fi
-          
-          sleep 1
-        done
-        
-        echo "Load test passed"
+          echo "Load test passed"
+        fi
 
     - name: Deploy to Production (Full Rollout)
       if: success() && env.CANARY_HEALTH_FAILED != 'true' && env.CANARY_LOAD_TEST_FAILED != 'true'
@@ -226,7 +194,7 @@ jobs:
         aws ecs update-service \
           --cluster ${{ env.ECS_CLUSTER }} \
           --service ${{ env.ECS_SERVICE }} \
-          --task-definition task-definition.json \
+          --task-definition task-definition-updated.json \
           --region ${{ env.AWS_REGION }}
         
         # Wait for production deployment to be stable

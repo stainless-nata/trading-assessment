@@ -3,3 +3,29 @@ services:
     build: .
     ports:
       - "8080:8080"
+    environment:
+      - SERVER_PORT=${SERVER_PORT:-8080}
+      - MONGO_URI=mongodb://mongo:27017
+      - SOLANA_RPC_URL=${SOLANA_RPC_URL:-https://api.mainnet-beta.solana.com}
+      - DISCORD_WEBHOOK=${DISCORD_WEBHOOK:-}
+    env_file:
+      - .env
+    depends_on:
+      - mongo
+    networks:
+      - trading-network
+
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_DATABASE=trading_api
+    volumes:
+      - ./init-mongo.js:/docker-entrypoint-initdb.d/init-mongo.js:ro
+    networks:
+      - trading-network
+
+networks:
+  trading-network:
+    driver: bridge

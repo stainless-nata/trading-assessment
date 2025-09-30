@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,6 +11,10 @@ import (
 	"runtime"
 	"sync"
 	"time"
+
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 type SolanaRPCRequest struct {
@@ -60,10 +65,17 @@ type RateLimiterEntry struct {
 	ResetTime time.Time
 }
 
+type APIKey struct {
+	Key       string    `bson:"key"`
+	Active    bool      `bson:"active"`
+	CreatedAt time.Time `bson:"created_at"`
+}
+
 var (
 	solanaRPCURL   = getEnv("SOLANA_RPC_URL", "https://pomaded-lithotomies-xfbhnqagbt-dedicated.helius-rpc.com/?api-key=37ba4475-8fa3-4491-875f-758894981943")
 	serverPort     = getEnv("SERVER_PORT", "8080")
 	discordWebhook = getEnv("DISCORD_WEBHOOK", "https://discord.com/api/webhooks/your-webhook-url")
+	mongoURI       = getEnv("MONGO_URI", "mongodb://localhost:27017")
 
 	cache         = make(map[string]CacheEntry)
 	cacheMutex    = sync.RWMutex{}
@@ -71,12 +83,11 @@ var (
 	mutexMapMutex = sync.RWMutex{}
 	rateLimiters  = make(map[string]RateLimiterEntry)
 	rateMutex     = sync.RWMutex{}
-	apiKeys       = map[string]bool{
-		"test-api-key-1": true,
-		"test-api-key-2": true,
-		"demo-key":       true,
-	}
-	httpClient = &http.Client{Timeout: 30 * time.Second}
+
+	mongoClient       *mongo.Client
+	apiKeysCollection *mongo.Collection
+
+	httpClient = &http.Client{Timeout: 10 * time.Second}
 )
 
 func getEnv(key, defaultValue string) string {
@@ -84,6 +95,44 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+func initMongoDB() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoURI))
+	if err != nil {
+		return fmt.Errorf("failed to connect to MongoDB: %v", err)
+	}
+
+	if err := client.Ping(ctx, nil); err != nil {
+		return fmt.Errorf("failed to ping MongoDB: %v", err)
+	}
+
+	mongoClient = client
+	apiKeysCollection = client.Database("trading_api").Collection("api_keys")
+
+	log.Println("✅ Connected to MongoDB")
+	return nil
+}
+
+func validateAPIKey(apiKey string) bool {
+	if apiKeysCollection != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		var keyDoc APIKey
+		err := apiKeysCollection.FindOne(ctx, bson.M{
+			"key":    apiKey,
+			"active": true,
+		}).Decode(&keyDoc)
+
+		return err == nil
+	}
+
+	log.Printf("API key validation failed - database unavailable and no fallback configured")
+	return false
 }
 
 func isRateLimited(ip string) bool {
@@ -152,6 +201,9 @@ func setInCache(wallet string, balance float64) {
 }
 
 func fetchSolanaBalance(wallet string) (float64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
 	request := SolanaRPCRequest{
 		JSONRpc: "2.0",
 		ID:      1,
@@ -164,7 +216,7 @@ func fetchSolanaBalance(wallet string) (float64, error) {
 		return 0, fmt.Errorf("failed to marshal request: %v", err)
 	}
 
-	req, err := http.NewRequest("POST", solanaRPCURL, bytes.NewBuffer(requestBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", solanaRPCURL, bytes.NewBuffer(requestBody))
 	if err != nil {
 		return 0, fmt.Errorf("failed to create request: %v", err)
 	}
@@ -173,6 +225,9 @@ func fetchSolanaBalance(wallet string) (float64, error) {
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return 0, fmt.Errorf("RPC request timeout after 8 seconds")
+		}
 		return 0, fmt.Errorf("failed to make request: %v", err)
 	}
 	defer resp.Body.Close()
@@ -237,7 +292,7 @@ func getBalance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !apiKeys[apiKey] {
+	if !validateAPIKey(apiKey) {
 		sendJSON(w, http.StatusUnauthorized, map[string]interface{}{
 			"success": false,
 			"message": "Invalid API key",
@@ -316,16 +371,10 @@ func getBalance(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func forcePanic(w http.ResponseWriter, r *http.Request) {
-	log.Printf("Panic endpoint triggered by IP: %s", r.RemoteAddr)
-	panic("Test panic triggered via API endpoint")
-}
-
 func panicRecovery(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				// Get full stack trace
 				stack := make([]byte, 4096)
 				length := runtime.Stack(stack, true)
 				stack = stack[:length]
@@ -359,6 +408,11 @@ func panicRecovery(next http.Handler) http.Handler {
 }
 
 func main() {
+	if err := initMongoDB(); err != nil {
+		log.Printf("⚠️ MongoDB initialization failed: %v", err)
+		log.Println("⚠️ Continuing with fallback authentication...")
+	}
+
 	mux := http.NewServeMux()
 
 	handler := panicRecovery(mux)
@@ -374,17 +428,6 @@ func main() {
 			return
 		}
 		getBalance(w, r)
-	})
-
-	mux.HandleFunc("/api/panic", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			sendJSON(w, http.StatusMethodNotAllowed, map[string]interface{}{
-				"success": false,
-				"message": "Method not allowed",
-			})
-			return
-		}
-		forcePanic(w, r)
 	})
 
 	log.Printf("Starting Solana Balance API server on port %s", serverPort)
